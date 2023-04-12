@@ -1,19 +1,18 @@
 use crate::{
     kzg10,
     marlin::{marlin_pc, Marlin},
+    CHALLENGE_SIZE,
 };
 use crate::{BatchLCProof, Error, Evaluations, QuerySet};
 use crate::{LabeledCommitment, LabeledPolynomial, LinearCombination};
 use crate::{PCRandomness, PCUniversalParams, PolynomialCommitment};
 use crate::{ToString, Vec};
-use ark_ec::{
-    msm::{FixedBaseMSM, VariableBaseMSM},
-    AffineCurve, PairingEngine, ProjectiveCurve,
-};
+use ark_ec::AffineRepr;
+use ark_ec::{pairing::Pairing, scalar_mul::fixed_base::FixedBase, CurveGroup, VariableBaseMSM};
 use ark_ff::{One, PrimeField, UniformRand, Zero};
-use ark_poly::{multivariate::Term, MVPolynomial};
+use ark_poly::{multivariate::Term, DenseMVPolynomial};
 use ark_std::rand::RngCore;
-use ark_std::{marker::PhantomData, ops::Index, vec};
+use ark_std::{marker::PhantomData, ops::Index, ops::Mul, vec};
 
 mod data_structures;
 pub use data_structures::*;
@@ -21,6 +20,8 @@ pub use data_structures::*;
 mod combinations;
 use combinations::*;
 
+use crate::challenge::ChallengeGenerator;
+use ark_crypto_primitives::sponge::CryptographicSponge;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -30,12 +31,15 @@ use rayon::prelude::*;
 ///
 /// [pst]: https://eprint.iacr.org/2011/587
 /// [marlin]: https://eprint.iacr.org/2019/104
-pub struct MarlinPST13<E: PairingEngine, P: MVPolynomial<E::Fr>> {
+pub struct MarlinPST13<E: Pairing, P: DenseMVPolynomial<E::ScalarField>, S: CryptographicSponge> {
     _engine: PhantomData<E>,
     _poly: PhantomData<P>,
+    _sponge: PhantomData<S>,
 }
 
-impl<E: PairingEngine, P: MVPolynomial<E::Fr>> MarlinPST13<E, P> {
+impl<E: Pairing, P: DenseMVPolynomial<E::ScalarField>, S: CryptographicSponge>
+    MarlinPST13<E, P, S>
+{
     /// Given some point `z`, compute the quotients `w_i(X)` s.t
     ///
     /// `p(X) - p(z) = (X_1-z_1)*w_1(X) + (X_2-z_2)*w_2(X) + ... + (X_l-z_l)*w_l(X)`
@@ -43,7 +47,7 @@ impl<E: PairingEngine, P: MVPolynomial<E::Fr>> MarlinPST13<E, P> {
     /// These quotients can always be found with no remainder.
     fn divide_at_point(p: &P, point: &P::Point) -> Vec<P>
     where
-        P::Point: Index<usize, Output = E::Fr>,
+        P::Point: Index<usize, Output = E::ScalarField>,
     {
         let num_vars = p.num_vars();
         if p.is_zero() {
@@ -111,7 +115,7 @@ impl<E: PairingEngine, P: MVPolynomial<E::Fr>> MarlinPST13<E, P> {
     /// Check that a given polynomial is supported by parameters
     fn check_degrees_and_bounds<'a>(
         supported_degree: usize,
-        p: &'a LabeledPolynomial<E::Fr, P>,
+        p: &'a LabeledPolynomial<E::ScalarField, P>,
     ) -> Result<(), Error>
     where
         P: 'a,
@@ -128,19 +132,20 @@ impl<E: PairingEngine, P: MVPolynomial<E::Fr>> MarlinPST13<E, P> {
     }
 
     /// Convert polynomial coefficients to `BigInt`
-    fn convert_to_bigints(p: &P) -> Vec<<E::Fr as PrimeField>::BigInt> {
+    fn convert_to_bigints(p: &P) -> Vec<<E::ScalarField as PrimeField>::BigInt> {
         let plain_coeffs = ark_std::cfg_into_iter!(p.terms())
-            .map(|(coeff, _)| coeff.into_repr())
+            .map(|(coeff, _)| coeff.into_bigint())
             .collect();
         plain_coeffs
     }
 }
 
-impl<E, P> PolynomialCommitment<E::Fr, P> for MarlinPST13<E, P>
+impl<E, P, S> PolynomialCommitment<E::ScalarField, P, S> for MarlinPST13<E, P, S>
 where
-    E: PairingEngine,
-    P: MVPolynomial<E::Fr> + Sync,
-    P::Point: Index<usize, Output = E::Fr>,
+    E: Pairing,
+    P: DenseMVPolynomial<E::ScalarField> + Sync,
+    S: CryptographicSponge,
+    P::Point: Index<usize, Output = E::ScalarField>,
 {
     type UniversalParams = UniversalParams<E, P>;
     type CommitterKey = CommitterKey<E, P>;
@@ -174,12 +179,12 @@ where
         // Trapdoor evaluation points
         let mut betas = Vec::with_capacity(num_vars);
         for _ in 0..num_vars {
-            betas.push(E::Fr::rand(rng));
+            betas.push(E::ScalarField::rand(rng));
         }
         // Generators
-        let g = E::G1Projective::rand(rng);
-        let gamma_g = E::G1Projective::rand(rng);
-        let h = E::G2Projective::rand(rng);
+        let g = E::G1::rand(rng);
+        let gamma_g = E::G1::rand(rng);
+        let h = E::G2::rand(rng);
 
         // A list of all variable numbers of multiplicity `max_degree`
         let variable_set: Vec<_> = (0..num_vars)
@@ -198,7 +203,7 @@ where
                 // trapdoor and generate a `P::Term` object to index it
                 ark_std::cfg_into_iter!(terms)
                     .map(|term| {
-                        let value: E::Fr = term.iter().map(|e| betas[*e]).product();
+                        let value: E::ScalarField = term.iter().map(|e| betas[*e]).product();
                         let term = (0..num_vars)
                             .map(|var| (var, term.iter().filter(|e| **e == var).count()))
                             .collect();
@@ -208,23 +213,19 @@ where
             })
             .unzip();
 
-        let scalar_bits = E::Fr::size_in_bits();
+        let scalar_bits = E::ScalarField::MODULUS_BIT_SIZE as usize;
         let g_time = start_timer!(|| "Generating powers of G");
-        let window_size = FixedBaseMSM::get_mul_window_size(max_degree + 1);
-        let g_table = FixedBaseMSM::get_window_table(scalar_bits, window_size, g);
-        let mut powers_of_g = FixedBaseMSM::multi_scalar_mul::<E::G1Projective>(
-            scalar_bits,
-            window_size,
-            &g_table,
-            &powers_of_beta,
-        );
+        let window_size = FixedBase::get_mul_window_size(max_degree + 1);
+        let g_table = FixedBase::get_window_table(scalar_bits, window_size, g);
+        let mut powers_of_g =
+            FixedBase::msm::<E::G1>(scalar_bits, window_size, &g_table, &powers_of_beta);
         powers_of_g.push(g);
         powers_of_beta_terms.push(P::Term::new(vec![]));
         end_timer!(g_time);
 
         let gamma_g_time = start_timer!(|| "Generating powers of gamma * G");
-        let window_size = FixedBaseMSM::get_mul_window_size(max_degree + 2);
-        let gamma_g_table = FixedBaseMSM::get_window_table(scalar_bits, window_size, gamma_g);
+        let window_size = FixedBase::get_mul_window_size(max_degree + 2);
+        let gamma_g_table = FixedBase::get_window_table(scalar_bits, window_size, gamma_g);
         // Each element `i` of `powers_of_gamma_g` is a vector of length `max_degree+1`
         // containing `betas[i]^j \gamma G` for `j` from 1 to `max_degree+1` to support
         // up to `max_degree` queries
@@ -233,12 +234,12 @@ where
             .enumerate()
             .for_each(|(i, v)| {
                 let mut powers_of_beta = Vec::with_capacity(max_degree);
-                let mut cur = E::Fr::one();
+                let mut cur = E::ScalarField::one();
                 for _ in 0..=max_degree {
                     cur *= &betas[i];
                     powers_of_beta.push(cur);
                 }
-                *v = FixedBaseMSM::multi_scalar_mul::<E::G1Projective>(
+                *v = FixedBase::msm::<E::G1>(
                     scalar_bits,
                     window_size,
                     &gamma_g_table,
@@ -247,16 +248,13 @@ where
             });
         end_timer!(gamma_g_time);
 
-        let powers_of_g = E::G1Projective::batch_normalization_into_affine(&powers_of_g);
+        let powers_of_g = E::G1::normalize_batch(&powers_of_g);
         let gamma_g = gamma_g.into_affine();
         let powers_of_gamma_g = powers_of_gamma_g
             .into_iter()
-            .map(|v| E::G1Projective::batch_normalization_into_affine(&v))
+            .map(|v| E::G1::normalize_batch(&v))
             .collect();
-        let beta_h: Vec<_> = betas
-            .iter()
-            .map(|b| h.mul(&(*b).into_repr()).into_affine())
-            .collect();
+        let beta_h: Vec<_> = betas.iter().map(|b| h.mul(b).into_affine()).collect();
         let h = h.into_affine();
         let prepared_h = h.into();
         let prepared_beta_h = beta_h.iter().map(|bh| (*bh).into()).collect();
@@ -342,7 +340,7 @@ where
     /// Outputs a commitments to `polynomials`.
     fn commit<'a>(
         ck: &Self::CommitterKey,
-        polynomials: impl IntoIterator<Item = &'a LabeledPolynomial<E::Fr, P>>,
+        polynomials: impl IntoIterator<Item = &'a LabeledPolynomial<E::ScalarField, P>>,
         rng: Option<&mut dyn RngCore>,
     ) -> Result<
         (
@@ -382,7 +380,7 @@ where
             end_timer!(to_bigint_time);
 
             let msm_time = start_timer!(|| "MSM to compute commitment to plaintext poly");
-            let mut commitment = VariableBaseMSM::multi_scalar_mul(&powers_of_g, &plain_ints);
+            let mut commitment = <E::G1 as VariableBaseMSM>::msm_bigint(&powers_of_g, &plain_ints);
             end_timer!(msm_time);
 
             // Sample random polynomial
@@ -418,11 +416,12 @@ where
 
             let msm_time = start_timer!(|| "MSM to compute commitment to random poly");
             let random_commitment =
-                VariableBaseMSM::multi_scalar_mul(&powers_of_gamma_g, &random_ints).into_affine();
+                <E::G1 as VariableBaseMSM>::msm_bigint(&powers_of_gamma_g, &random_ints)
+                    .into_affine();
             end_timer!(msm_time);
 
             // Mask commitment with random poly
-            commitment.add_assign_mixed(&random_commitment);
+            commitment += &random_commitment;
 
             let comm = Self::Commitment {
                 comm: kzg10::Commitment(commitment.into()),
@@ -438,12 +437,12 @@ where
     }
 
     /// On input a polynomial `p` and a point `point`, outputs a proof for the same.
-    fn open_individual_opening_challenges<'a>(
+    fn open<'a>(
         ck: &Self::CommitterKey,
-        labeled_polynomials: impl IntoIterator<Item = &'a LabeledPolynomial<E::Fr, P>>,
+        labeled_polynomials: impl IntoIterator<Item = &'a LabeledPolynomial<E::ScalarField, P>>,
         _commitments: impl IntoIterator<Item = &'a LabeledCommitment<Self::Commitment>>,
         point: &P::Point,
-        opening_challenges: &dyn Fn(u64) -> E::Fr,
+        opening_challenges: &mut ChallengeGenerator<E::ScalarField, S>,
         rands: impl IntoIterator<Item = &'a Self::Randomness>,
         _rng: Option<&mut dyn RngCore>,
     ) -> Result<Self::Proof, Self::Error>
@@ -455,13 +454,11 @@ where
         // Compute random linear combinations of committed polynomials and randomness
         let mut p = P::zero();
         let mut r = Randomness::empty();
-        let mut opening_challenge_counter = 0;
         for (polynomial, rand) in labeled_polynomials.into_iter().zip(rands) {
             Self::check_degrees_and_bounds(ck.supported_degree, &polynomial)?;
 
             // compute challenge^j and challenge^{j+1}.
-            let challenge_j = opening_challenges(opening_challenge_counter);
-            opening_challenge_counter += 1;
+            let challenge_j = opening_challenges.try_next_challenge_of_size(CHALLENGE_SIZE);
 
             p += (challenge_j, polynomial.polynomial());
             r += (challenge_j, rand);
@@ -488,7 +485,7 @@ where
                 // Convert coefficients to BigInt
                 let witness_ints = Self::convert_to_bigints(&w);
                 // Compute MSM
-                VariableBaseMSM::multi_scalar_mul(&powers_of_g, &witness_ints)
+                <E::G1 as VariableBaseMSM>::msm_bigint(&powers_of_g, &witness_ints)
             })
             .collect::<Vec<_>>();
         end_timer!(witness_comm_time);
@@ -518,7 +515,7 @@ where
                     // Convert coefficients to BigInt
                     let hiding_witness_ints = Self::convert_to_bigints(hiding_witness);
                     // Compute MSM and add result to witness
-                    *witness += &VariableBaseMSM::multi_scalar_mul(
+                    *witness += &<E::G1 as VariableBaseMSM>::msm_bigint(
                         &powers_of_gamma_g,
                         &hiding_witness_ints,
                     );
@@ -537,13 +534,13 @@ where
 
     /// Verifies that `value` is the evaluation at `x` of the polynomial
     /// committed inside `comm`.
-    fn check_individual_opening_challenges<'a>(
+    fn check<'a>(
         vk: &Self::VerifierKey,
         commitments: impl IntoIterator<Item = &'a LabeledCommitment<Self::Commitment>>,
         point: &'a P::Point,
-        values: impl IntoIterator<Item = E::Fr>,
+        values: impl IntoIterator<Item = E::ScalarField>,
         proof: &Self::Proof,
-        opening_challenges: &dyn Fn(u64) -> E::Fr,
+        opening_challenges: &mut ChallengeGenerator<E::ScalarField, S>,
         _rng: Option<&mut dyn RngCore>,
     ) -> Result<bool, Self::Error>
     where
@@ -552,65 +549,67 @@ where
         let check_time = start_timer!(|| "Checking evaluations");
         // Accumulate commitments and values
         let (combined_comm, combined_value) =
-            Marlin::accumulate_commitments_and_values_individual_opening_challenges(
+            Marlin::<E, S, P, Self>::accumulate_commitments_and_values(
                 commitments,
                 values,
                 opening_challenges,
                 None,
             )?;
         // Compute both sides of the pairing equation
-        let mut inner = combined_comm.into().into_projective() - &vk.g.mul(combined_value);
+        let mut inner = combined_comm.into().into_group() - &vk.g.mul(combined_value);
         if let Some(random_v) = proof.random_v {
             inner -= &vk.gamma_g.mul(random_v);
         }
         let lhs = E::pairing(inner, vk.h);
 
         // Create a list of elements corresponding to each pairing in the product on the rhs
-        let rhs_product: Vec<(E::G1Prepared, E::G2Prepared)> = ark_std::cfg_iter!(proof.w)
-            .enumerate()
-            .map(|(j, w_j)| {
-                let beta_minus_z: E::G2Affine =
-                    (vk.beta_h[j].into_projective() - &vk.h.mul(point[j])).into();
-                ((*w_j).into(), beta_minus_z.into())
-            })
-            .collect();
-        let rhs = E::product_of_pairings(&rhs_product);
+        let (rhs_product_g1, rhs_product_g2): (Vec<E::G1Prepared>, Vec<E::G2Prepared>) =
+            ark_std::cfg_iter!(proof.w)
+                .enumerate()
+                .map(|(j, w_j)| {
+                    let beta_minus_z: E::G2Affine =
+                        (vk.beta_h[j].into_group() - &vk.h.mul(point[j])).into();
+                    ((*w_j).into(), beta_minus_z.into())
+                })
+                .unzip();
+        let rhs = E::multi_pairing(rhs_product_g1, rhs_product_g2);
         end_timer!(check_time);
 
         Ok(lhs == rhs)
     }
 
-    fn batch_check_individual_opening_challenges<'a, R: RngCore>(
+    fn batch_check<'a, R: RngCore>(
         vk: &Self::VerifierKey,
         commitments: impl IntoIterator<Item = &'a LabeledCommitment<Self::Commitment>>,
         query_set: &QuerySet<P::Point>,
-        values: &Evaluations<P::Point, E::Fr>,
+        values: &Evaluations<P::Point, E::ScalarField>,
         proof: &Self::BatchProof,
-        opening_challenges: &dyn Fn(u64) -> E::Fr,
+        opening_challenges: &mut ChallengeGenerator<E::ScalarField, S>,
         rng: &mut R,
     ) -> Result<bool, Self::Error>
     where
         Self::Commitment: 'a,
     {
-        let (combined_comms, combined_queries, combined_evals) = Marlin::combine_and_normalize(
-            commitments,
-            query_set,
-            values,
-            opening_challenges,
-            None,
-        )?;
+        let (combined_comms, combined_queries, combined_evals) =
+            Marlin::<E, S, P, Self>::combine_and_normalize(
+                commitments,
+                query_set,
+                values,
+                opening_challenges,
+                None,
+            )?;
         let check_time =
             start_timer!(|| format!("Checking {} evaluation proofs", combined_comms.len()));
-        let g = vk.g.into_projective();
-        let gamma_g = vk.gamma_g.into_projective();
-        let mut total_c = <E::G1Projective>::zero();
-        let mut total_w = vec![<E::G1Projective>::zero(); vk.num_vars];
+        let g = vk.g.into_group();
+        let gamma_g = vk.gamma_g.into_group();
+        let mut total_c = <E::G1>::zero();
+        let mut total_w = vec![<E::G1>::zero(); vk.num_vars];
         let combination_time = start_timer!(|| "Combining commitments and proofs");
-        let mut randomizer = E::Fr::one();
+        let mut randomizer = E::ScalarField::one();
         // Instead of multiplying g and gamma_g in each turn, we simply accumulate
         // their coefficients and perform a final multiplication at the end.
-        let mut g_multiplier = E::Fr::zero();
-        let mut gamma_g_multiplier = E::Fr::zero();
+        let mut g_multiplier = E::ScalarField::zero();
+        let mut gamma_g_multiplier = E::ScalarField::zero();
         for (((c, z), v), proof) in combined_comms
             .iter()
             .zip(combined_queries)
@@ -618,17 +617,17 @@ where
             .zip(proof)
         {
             let w = &proof.w;
-            let mut temp: E::G1Projective = ark_std::cfg_iter!(w)
+            let mut temp: E::G1 = ark_std::cfg_iter!(w)
                 .enumerate()
                 .map(|(j, w_j)| w_j.mul(z[j]))
                 .sum();
-            temp.add_assign_mixed(&c.0);
+            temp += &c.0;
             let c = temp;
             g_multiplier += &(randomizer * &v);
             if let Some(random_v) = proof.random_v {
                 gamma_g_multiplier += &(randomizer * &random_v);
             }
-            total_c += &c.mul(&randomizer.into_repr());
+            total_c += &c.mul(&randomizer);
             ark_std::cfg_iter_mut!(total_w)
                 .enumerate()
                 .for_each(|(i, w_i)| *w_i += &w[i].mul(randomizer));
@@ -636,43 +635,45 @@ where
             // only from 128-bit strings.
             randomizer = u128::rand(rng).into();
         }
-        total_c -= &g.mul(&g_multiplier.into_repr());
-        total_c -= &gamma_g.mul(&gamma_g_multiplier.into_repr());
+        total_c -= &g.mul(&g_multiplier);
+        total_c -= &gamma_g.mul(&gamma_g_multiplier);
         end_timer!(combination_time);
 
         let to_affine_time = start_timer!(|| "Converting results to affine for pairing");
-        let mut pairings = Vec::new();
-        total_w.into_iter().enumerate().for_each(|(j, w_j)| {
-            pairings.push(((-w_j).into_affine().into(), vk.prepared_beta_h[j].clone()))
-        });
-        pairings.push((total_c.into_affine().into(), vk.prepared_h.clone()));
+        let (mut p1, mut p2): (Vec<E::G1Prepared>, Vec<E::G2Prepared>) = total_w
+            .into_iter()
+            .enumerate()
+            .map(|(j, w_j)| ((-w_j).into_affine().into(), vk.prepared_beta_h[j].clone()))
+            .unzip();
+        p1.push(total_c.into_affine().into());
+        p2.push(vk.prepared_h.clone());
         end_timer!(to_affine_time);
 
         let pairing_time = start_timer!(|| "Performing product of pairings");
-        let result = E::product_of_pairings(&pairings).is_one();
+        let result = E::multi_pairing(p1, p2).0.is_one();
         end_timer!(pairing_time);
         end_timer!(check_time);
         Ok(result)
     }
 
-    fn open_combinations_individual_opening_challenges<'a>(
+    fn open_combinations<'a>(
         ck: &Self::CommitterKey,
-        lc_s: impl IntoIterator<Item = &'a LinearCombination<E::Fr>>,
-        polynomials: impl IntoIterator<Item = &'a LabeledPolynomial<E::Fr, P>>,
+        linear_combinations: impl IntoIterator<Item = &'a LinearCombination<E::ScalarField>>,
+        polynomials: impl IntoIterator<Item = &'a LabeledPolynomial<E::ScalarField, P>>,
         commitments: impl IntoIterator<Item = &'a LabeledCommitment<Self::Commitment>>,
         query_set: &QuerySet<P::Point>,
-        opening_challenges: &dyn Fn(u64) -> E::Fr,
+        opening_challenges: &mut ChallengeGenerator<E::ScalarField, S>,
         rands: impl IntoIterator<Item = &'a Self::Randomness>,
         rng: Option<&mut dyn RngCore>,
-    ) -> Result<BatchLCProof<E::Fr, P, Self>, Self::Error>
+    ) -> Result<BatchLCProof<E::ScalarField, Self::BatchProof>, Self::Error>
     where
         P: 'a,
         Self::Randomness: 'a,
         Self::Commitment: 'a,
     {
-        Marlin::open_combinations_individual_opening_challenges(
+        Marlin::<E, S, P, Self>::open_combinations(
             ck,
-            lc_s,
+            linear_combinations,
             polynomials,
             commitments,
             query_set,
@@ -684,25 +685,25 @@ where
 
     /// Checks that `values` are the true evaluations at `query_set` of the polynomials
     /// committed in `labeled_commitments`.
-    fn check_combinations_individual_opening_challenges<'a, R: RngCore>(
+    fn check_combinations<'a, R: RngCore>(
         vk: &Self::VerifierKey,
-        lc_s: impl IntoIterator<Item = &'a LinearCombination<E::Fr>>,
+        linear_combinations: impl IntoIterator<Item = &'a LinearCombination<E::ScalarField>>,
         commitments: impl IntoIterator<Item = &'a LabeledCommitment<Self::Commitment>>,
-        query_set: &QuerySet<P::Point>,
-        evaluations: &Evaluations<P::Point, E::Fr>,
-        proof: &BatchLCProof<E::Fr, P, Self>,
-        opening_challenges: &dyn Fn(u64) -> E::Fr,
+        eqn_query_set: &QuerySet<P::Point>,
+        eqn_evaluations: &Evaluations<P::Point, E::ScalarField>,
+        proof: &BatchLCProof<E::ScalarField, Self::BatchProof>,
+        opening_challenges: &mut ChallengeGenerator<E::ScalarField, S>,
         rng: &mut R,
     ) -> Result<bool, Self::Error>
     where
         Self::Commitment: 'a,
     {
-        Marlin::check_combinations_individual_opening_challenges(
+        Marlin::<E, S, P, Self>::check_combinations(
             vk,
-            lc_s,
+            linear_combinations,
             commitments,
-            query_set,
-            evaluations,
+            eqn_query_set,
+            eqn_evaluations,
             proof,
             opening_challenges,
             rng,
@@ -716,34 +717,43 @@ mod tests {
     use super::MarlinPST13;
     use ark_bls12_377::Bls12_377;
     use ark_bls12_381::Bls12_381;
-    use ark_ec::PairingEngine;
+    use ark_crypto_primitives::sponge::poseidon::PoseidonSponge;
+    use ark_ec::pairing::Pairing;
     use ark_ff::UniformRand;
     use ark_poly::{
         multivariate::{SparsePolynomial as SparsePoly, SparseTerm},
-        MVPolynomial,
+        DenseMVPolynomial,
     };
-    use ark_std::rand::rngs::StdRng;
+    use ark_std::vec::Vec;
+    use rand_chacha::ChaCha20Rng;
 
-    type MVPoly_381 = SparsePoly<<Bls12_381 as PairingEngine>::Fr, SparseTerm>;
-    type MVPoly_377 = SparsePoly<<Bls12_377 as PairingEngine>::Fr, SparseTerm>;
+    type MVPoly_381 = SparsePoly<<Bls12_381 as Pairing>::ScalarField, SparseTerm>;
+    type MVPoly_377 = SparsePoly<<Bls12_377 as Pairing>::ScalarField, SparseTerm>;
 
-    type PC<E, P> = MarlinPST13<E, P>;
-    type PC_Bls12_381 = PC<Bls12_381, MVPoly_381>;
-    type PC_Bls12_377 = PC<Bls12_377, MVPoly_377>;
+    type PC<E, P, S> = MarlinPST13<E, P, S>;
 
-    fn rand_poly<E: PairingEngine>(
+    type Sponge_bls12_381 = PoseidonSponge<<Bls12_381 as Pairing>::ScalarField>;
+    type Sponge_Bls12_377 = PoseidonSponge<<Bls12_377 as Pairing>::ScalarField>;
+
+    type PC_Bls12_381 = PC<Bls12_381, MVPoly_381, Sponge_bls12_381>;
+    type PC_Bls12_377 = PC<Bls12_377, MVPoly_377, Sponge_Bls12_377>;
+
+    fn rand_poly<E: Pairing>(
         degree: usize,
         num_vars: Option<usize>,
-        rng: &mut StdRng,
-    ) -> SparsePoly<E::Fr, SparseTerm> {
-        SparsePoly::<E::Fr, SparseTerm>::rand(degree, num_vars.unwrap(), rng)
+        rng: &mut ChaCha20Rng,
+    ) -> SparsePoly<E::ScalarField, SparseTerm> {
+        SparsePoly::<E::ScalarField, SparseTerm>::rand(degree, num_vars.unwrap(), rng)
     }
 
-    fn rand_point<E: PairingEngine>(num_vars: Option<usize>, rng: &mut StdRng) -> Vec<E::Fr> {
+    fn rand_point<E: Pairing>(
+        num_vars: Option<usize>,
+        rng: &mut ChaCha20Rng,
+    ) -> Vec<E::ScalarField> {
         let num_vars = num_vars.unwrap();
         let mut point = Vec::with_capacity(num_vars);
         for _ in 0..num_vars {
-            point.push(E::Fr::rand(rng));
+            point.push(E::ScalarField::rand(rng));
         }
         point
     }
@@ -752,16 +762,18 @@ mod tests {
     fn single_poly_test() {
         use crate::tests::*;
         let num_vars = Some(10);
-        single_poly_test::<_, _, PC_Bls12_377>(
+        single_poly_test::<_, _, PC_Bls12_377, _>(
             num_vars,
             rand_poly::<Bls12_377>,
             rand_point::<Bls12_377>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-377");
-        single_poly_test::<_, _, PC_Bls12_381>(
+        single_poly_test::<_, _, PC_Bls12_381, _>(
             num_vars,
             rand_poly::<Bls12_381>,
             rand_point::<Bls12_381>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-381");
     }
@@ -770,17 +782,19 @@ mod tests {
     fn full_end_to_end_test() {
         use crate::tests::*;
         let num_vars = Some(10);
-        full_end_to_end_test::<_, _, PC_Bls12_377>(
+        full_end_to_end_test::<_, _, PC_Bls12_377, _>(
             num_vars,
             rand_poly::<Bls12_377>,
             rand_point::<Bls12_377>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-377");
         println!("Finished bls12-377");
-        full_end_to_end_test::<_, _, PC_Bls12_381>(
+        full_end_to_end_test::<_, _, PC_Bls12_381, _>(
             num_vars,
             rand_poly::<Bls12_381>,
             rand_point::<Bls12_381>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-381");
         println!("Finished bls12-381");
@@ -790,17 +804,19 @@ mod tests {
     fn single_equation_test() {
         use crate::tests::*;
         let num_vars = Some(10);
-        single_equation_test::<_, _, PC_Bls12_377>(
+        single_equation_test::<_, _, PC_Bls12_377, _>(
             num_vars,
             rand_poly::<Bls12_377>,
             rand_point::<Bls12_377>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-377");
         println!("Finished bls12-377");
-        single_equation_test::<_, _, PC_Bls12_381>(
+        single_equation_test::<_, _, PC_Bls12_381, _>(
             num_vars,
             rand_poly::<Bls12_381>,
             rand_point::<Bls12_381>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-381");
         println!("Finished bls12-381");
@@ -810,17 +826,19 @@ mod tests {
     fn two_equation_test() {
         use crate::tests::*;
         let num_vars = Some(10);
-        two_equation_test::<_, _, PC_Bls12_377>(
+        two_equation_test::<_, _, PC_Bls12_377, _>(
             num_vars,
             rand_poly::<Bls12_377>,
             rand_point::<Bls12_377>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-377");
         println!("Finished bls12-377");
-        two_equation_test::<_, _, PC_Bls12_381>(
+        two_equation_test::<_, _, PC_Bls12_381, _>(
             num_vars,
             rand_poly::<Bls12_381>,
             rand_point::<Bls12_381>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-381");
         println!("Finished bls12-381");
@@ -830,17 +848,19 @@ mod tests {
     fn full_end_to_end_equation_test() {
         use crate::tests::*;
         let num_vars = Some(10);
-        full_end_to_end_equation_test::<_, _, PC_Bls12_377>(
+        full_end_to_end_equation_test::<_, _, PC_Bls12_377, _>(
             num_vars,
             rand_poly::<Bls12_377>,
             rand_point::<Bls12_377>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-377");
         println!("Finished bls12-377");
-        full_end_to_end_equation_test::<_, _, PC_Bls12_381>(
+        full_end_to_end_equation_test::<_, _, PC_Bls12_381, _>(
             num_vars,
             rand_poly::<Bls12_381>,
             rand_point::<Bls12_381>,
+            poseidon_sponge_for_test,
         )
         .expect("test failed for bls12-381");
         println!("Finished bls12-381");

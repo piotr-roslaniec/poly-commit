@@ -1,18 +1,15 @@
 use crate::*;
 use crate::{PCCommitterKey, PCVerifierKey, Vec};
-use ark_ec::AffineCurve;
-use ark_ff::{Field, ToBytes, UniformRand, Zero};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
+use ark_ec::AffineRepr;
+use ark_ff::{Field, UniformRand, Zero};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::RngCore;
-use ark_std::{
-    io::{Read, Write},
-    vec,
-};
+use ark_std::vec;
 
 /// `UniversalParams` are the universal parameters for the inner product arg scheme.
 #[derive(Derivative, CanonicalSerialize, CanonicalDeserialize)]
 #[derivative(Default(bound = ""), Clone(bound = ""), Debug(bound = ""))]
-pub struct UniversalParams<G: AffineCurve> {
+pub struct UniversalParams<G: AffineRepr> {
     /// The key used to commit to polynomials.
     pub comm_key: Vec<G>,
 
@@ -23,7 +20,7 @@ pub struct UniversalParams<G: AffineCurve> {
     pub s: G,
 }
 
-impl<G: AffineCurve> PCUniversalParams for UniversalParams<G> {
+impl<G: AffineRepr> PCUniversalParams for UniversalParams<G> {
     fn max_degree(&self) -> usize {
         self.comm_key.len() - 1
     }
@@ -38,7 +35,7 @@ impl<G: AffineCurve> PCUniversalParams for UniversalParams<G> {
     Clone(bound = ""),
     Debug(bound = "")
 )]
-pub struct CommitterKey<G: AffineCurve> {
+pub struct CommitterKey<G: AffineRepr> {
     /// The key used to commit to polynomials.
     pub comm_key: Vec<G>,
 
@@ -54,7 +51,7 @@ pub struct CommitterKey<G: AffineCurve> {
     pub max_degree: usize,
 }
 
-impl<G: AffineCurve> PCCommitterKey for CommitterKey<G> {
+impl<G: AffineRepr> PCCommitterKey for CommitterKey<G> {
     fn max_degree(&self) -> usize {
         self.max_degree
     }
@@ -66,7 +63,7 @@ impl<G: AffineCurve> PCCommitterKey for CommitterKey<G> {
 /// `VerifierKey` is used to check evaluation proofs for a given commitment.
 pub type VerifierKey<G> = CommitterKey<G>;
 
-impl<G: AffineCurve> PCVerifierKey for VerifierKey<G> {
+impl<G: AffineRepr> PCVerifierKey for VerifierKey<G> {
     fn max_degree(&self) -> usize {
         self.max_degree
     }
@@ -79,7 +76,7 @@ impl<G: AffineCurve> PCVerifierKey for VerifierKey<G> {
 /// Nothing to do to prepare this verifier key (for now).
 pub type PreparedVerifierKey<G> = VerifierKey<G>;
 
-impl<G: AffineCurve> PCPreparedVerifierKey<VerifierKey<G>> for PreparedVerifierKey<G> {
+impl<G: AffineRepr> PCPreparedVerifierKey<VerifierKey<G>> for PreparedVerifierKey<G> {
     /// prepare `PreparedVerifierKey` from `VerifierKey`
     fn prepare(vk: &VerifierKey<G>) -> Self {
         vk.clone()
@@ -97,7 +94,7 @@ impl<G: AffineCurve> PCPreparedVerifierKey<VerifierKey<G>> for PreparedVerifierK
     PartialEq(bound = ""),
     Eq(bound = "")
 )]
-pub struct Commitment<G: AffineCurve> {
+pub struct Commitment<G: AffineRepr> {
     /// A Pedersen commitment to the polynomial.
     pub comm: G,
 
@@ -107,7 +104,7 @@ pub struct Commitment<G: AffineCurve> {
     pub shifted_comm: Option<G>,
 }
 
-impl<G: AffineCurve> PCCommitment for Commitment<G> {
+impl<G: AffineRepr> PCCommitment for Commitment<G> {
     #[inline]
     fn empty() -> Self {
         Commitment {
@@ -119,29 +116,12 @@ impl<G: AffineCurve> PCCommitment for Commitment<G> {
     fn has_degree_bound(&self) -> bool {
         false
     }
-
-    fn size_in_bytes(&self) -> usize {
-        ark_ff::to_bytes![G::zero()].unwrap().len() / 2
-    }
-}
-
-impl<G: AffineCurve> ToBytes for Commitment<G> {
-    #[inline]
-    fn write<W: Write>(&self, mut writer: W) -> ark_std::io::Result<()> {
-        self.comm.write(&mut writer)?;
-        let shifted_exists = self.shifted_comm.is_some();
-        shifted_exists.write(&mut writer)?;
-        self.shifted_comm
-            .as_ref()
-            .unwrap_or(&G::zero())
-            .write(&mut writer)
-    }
 }
 
 /// Nothing to do to prepare this commitment (for now).
 pub type PreparedCommitment<E> = Commitment<E>;
 
-impl<G: AffineCurve> PCPreparedCommitment<Commitment<G>> for PreparedCommitment<G> {
+impl<G: AffineRepr> PCPreparedCommitment<Commitment<G>> for PreparedCommitment<G> {
     /// prepare `PreparedCommitment` from `Commitment`
     fn prepare(vk: &Commitment<G>) -> Self {
         vk.clone()
@@ -158,7 +138,7 @@ impl<G: AffineCurve> PCPreparedCommitment<Commitment<G>> for PreparedCommitment<
     PartialEq(bound = ""),
     Eq(bound = "")
 )]
-pub struct Randomness<G: AffineCurve> {
+pub struct Randomness<G: AffineRepr> {
     /// Randomness is some scalar field element.
     pub rand: G::ScalarField,
 
@@ -166,7 +146,7 @@ pub struct Randomness<G: AffineCurve> {
     pub shifted_rand: Option<G::ScalarField>,
 }
 
-impl<G: AffineCurve> PCRandomness for Randomness<G> {
+impl<G: AffineRepr> PCRandomness for Randomness<G> {
     fn empty() -> Self {
         Self {
             rand: G::ScalarField::zero(),
@@ -194,7 +174,7 @@ impl<G: AffineCurve> PCRandomness for Randomness<G> {
     Clone(bound = ""),
     Debug(bound = "")
 )]
-pub struct Proof<G: AffineCurve> {
+pub struct Proof<G: AffineRepr> {
     /// Vector of left elements for each of the log_d iterations in `open`
     pub l_vec: Vec<G>,
 
@@ -214,30 +194,6 @@ pub struct Proof<G: AffineCurve> {
     /// to the opened polynomials, along with the randomness used for the
     /// commitment to the hiding polynomial.
     pub rand: Option<G::ScalarField>,
-}
-
-impl<G: AffineCurve> PCProof for Proof<G> {
-    fn size_in_bytes(&self) -> usize {
-        ark_ff::to_bytes![self].unwrap().len()
-    }
-}
-
-impl<G: AffineCurve> ToBytes for Proof<G> {
-    #[inline]
-    fn write<W: Write>(&self, mut writer: W) -> ark_std::io::Result<()> {
-        self.l_vec.write(&mut writer)?;
-        self.r_vec.write(&mut writer)?;
-        self.final_comm_key.write(&mut writer)?;
-        self.c.write(&mut writer)?;
-        self.hiding_comm
-            .as_ref()
-            .unwrap_or(&G::zero())
-            .write(&mut writer)?;
-        self.rand
-            .as_ref()
-            .unwrap_or(&G::ScalarField::zero())
-            .write(&mut writer)
-    }
 }
 
 /// `SuccinctCheckPolynomial` is a succinctly-representated polynomial

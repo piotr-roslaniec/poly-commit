@@ -1,10 +1,9 @@
-use crate::{Polynomial, PolynomialCommitment, Rc, String, Vec};
-use ark_ff::{Field, ToConstraintField};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError};
+use crate::{Polynomial, String, Vec};
+use ark_ff::{Field, PrimeField, ToConstraintField};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::RngCore;
 use ark_std::{
     borrow::Borrow,
-    io::{Read, Write},
     marker::PhantomData,
     ops::{AddAssign, MulAssign, SubAssign},
 };
@@ -56,17 +55,12 @@ pub trait PCPreparedVerifierKey<Unprepared: PCVerifierKey> {
 
 /// Defines the minimal interface of commitments for any polynomial
 /// commitment scheme.
-pub trait PCCommitment:
-    Clone + ark_ff::ToBytes + CanonicalSerialize + CanonicalDeserialize
-{
+pub trait PCCommitment: Clone + CanonicalSerialize + CanonicalDeserialize {
     /// Outputs a non-hiding commitment to the zero polynomial.
     fn empty() -> Self;
 
     /// Does this commitment have a degree bound?
     fn has_degree_bound(&self) -> bool;
-
-    /// Size in bytes
-    fn size_in_bytes(&self) -> usize;
 }
 
 /// Defines the minimal interface of prepared commitments for any polynomial
@@ -95,18 +89,11 @@ pub trait PCRandomness: Clone + CanonicalSerialize + CanonicalDeserialize {
     ) -> Self;
 }
 
-/// Defines the minimal interface of evaluation proofs for any polynomial
-/// commitment scheme.
-pub trait PCProof: Clone + ark_ff::ToBytes + CanonicalSerialize + CanonicalDeserialize {
-    /// Size in bytes
-    fn size_in_bytes(&self) -> usize;
-}
-
 /// A proof of satisfaction of linear combinations.
 #[derive(Clone, CanonicalSerialize, CanonicalDeserialize)]
-pub struct BatchLCProof<F: Field, P: Polynomial<F>, PC: PolynomialCommitment<F, P>> {
+pub struct BatchLCProof<F: PrimeField, T: Clone + CanonicalSerialize + CanonicalDeserialize> {
     /// Evaluation proof.
-    pub proof: PC::BatchProof,
+    pub proof: T,
     /// Evaluations required to verify the proof.
     pub evals: Option<Vec<F>>,
 }
@@ -117,7 +104,7 @@ pub struct BatchLCProof<F: Field, P: Polynomial<F>, PC: PolynomialCommitment<F, 
 #[derive(Debug, Clone, CanonicalSerialize, CanonicalDeserialize)]
 pub struct LabeledPolynomial<F: Field, P: Polynomial<F>> {
     label: PolynomialLabel,
-    polynomial: Rc<P>,
+    polynomial: P,
     degree_bound: Option<usize>,
     hiding_bound: Option<usize>,
     _field: PhantomData<F>,
@@ -141,7 +128,7 @@ impl<'a, F: Field, P: Polynomial<F>> LabeledPolynomial<F, P> {
     ) -> Self {
         Self {
             label,
-            polynomial: Rc::new(polynomial),
+            polynomial: polynomial,
             degree_bound,
             hiding_bound,
             _field: PhantomData,
@@ -153,9 +140,13 @@ impl<'a, F: Field, P: Polynomial<F>> LabeledPolynomial<F, P> {
         &self.label
     }
 
-    /// Retrieve the polynomial from `self`
+    /// Retrieve an immutable reference to the polynomial contained in `self`.
     pub fn polynomial(&self) -> &P {
         &self.polynomial
+    }
+    /// Retrieve a mutable reference to the polynomial contained in `self`
+    pub fn polynomial_mut(&mut self) -> &mut P {
+        &mut self.polynomial
     }
 
     /// Evaluate the polynomial in `self`.
@@ -223,13 +214,6 @@ impl<C: PCCommitment> LabeledCommitment<C> {
     /// Retrieve the degree bound in `self`.
     pub fn degree_bound(&self) -> Option<usize> {
         self.degree_bound
-    }
-}
-
-impl<C: PCCommitment> ark_ff::ToBytes for LabeledCommitment<C> {
-    #[inline]
-    fn write<W: Write>(&self, writer: W) -> ark_std::io::Result<()> {
-        self.commitment.write(writer)
     }
 }
 
